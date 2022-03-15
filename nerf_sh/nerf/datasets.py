@@ -18,6 +18,7 @@
 """Different datasets implementation plus a general port for all the datasets."""
 INTERNAL = False  # pylint: disable=g-statement-before-imports
 import json
+import yaml
 import os
 from os import path
 import queue
@@ -542,6 +543,7 @@ class NSVF(Dataset):
                 )
 
             images.append(image)
+        #case one channel images
         self.images = np.stack(images, axis=0)
         self.n_examples, self.h, self.w = self.images.shape[:3]
         self.resolution = self.h * self.w
@@ -552,8 +554,116 @@ class NSVF(Dataset):
             self.focal /= args.factor
 
 
+class FlexSight(Dataset):
+    """FlexSight Dataset."""
+
+    def _load_renderings(self, args):
+        """Load images from disk."""
+        if args.render_path:
+            raise ValueError("render_path cannot be used for the FlexSight dataset.")
+        args.data_dir = path.expanduser(args.data_dir)
+        img_files = sorted(os.listdir(path.join(args.data_dir, 'images')))
+        mask_files = sorted(os.listdir(path.join(args.data_dir, 'mask')))
+
+        images = []
+        mask = []
+        in_matrices, ex_matrices, resolutions = self.scanner_converter(path.join(args.data_dir, 'cameras.yml'), args.factor)
+        assert len(img_files) == len(ex_matrices)
+        print(' Load fs', args.data_dir, 'split', self.split, 'num_images', len(img_files))
+        for img_fname, mask_fname in tqdm(zip(img_files, mask_files), total=len(img_files)):
+            img_fname = path.join(args.data_dir, 'images', img_fname)
+            mask_fname = path.join(args.data_dir, 'mask', mask_fname)
+
+            with utils.open_file(img_fname, "rb") as imgin:
+                image = np.array(Image.open(imgin), dtype=np.float32) / 255.0
+            with utils.open_file(mask_fname, "rb") as maskin:
+                mask = np.array(Image.open(maskin), dtype=np.float32) / 255.0
+            if image.ndim < 3:
+                image = np.repeat(image[:, :, None], 3, axis=-1)
+
+            if args.white_bkgd:
+                image = image[..., :3] * mask[Ellipsis, None] + (1.0 - mask[Ellipsis, None])
+            else:
+                image = image[..., :3]
+            if args.factor > 1:
+                [rsz_h, rsz_w] = [hw // args.factor for hw in image.shape[:2]]
+                image = cv2.resize(
+                    image, (rsz_w, rsz_h), interpolation=cv2.INTER_AREA
+                )
+
+            images.append(image)
+
+        images = np.stack(images, axis=0)
+        # Select the split.
+        i_test = np.arange(images.shape[0])[:: args.fshold]
+        i_train = np.array(
+            [i for i in np.arange(int(images.shape[0])) if i not in i_test]
+        )
+        if self.split == "train":
+            indices = i_train
+        else:
+            indices = i_test
+        images = images[indices]
+        intrinsics = np.stack(in_matrices, axis=0).astype(np.float32)
+        extrinsics = np.stack(ex_matrices, axis=0).astype(np.float32)
+        intrinsics = intrinsics[indices]
+        extrinsics = extrinsics[indices]
+
+        print("tt", images.shape)
+        self.images = np.stack(images, axis=0)
+        self.n_examples, self.h, self.w = self.images.shape[:3]
+        self.resolution = self.h * self.w
+        self.intrinsics = intrinsics
+        self.extrinsics = extrinsics
+
+    def _generate_rays(self):
+        """
+        Generate normalized device coordinate rays for fs
+        """
+        self.rays = utils.fs_generate_rays(self.w, self.h, self.intrinsics, self.extrinsics)
+
+    def scanner_converter(self, yaml_file, factor=1.0):
+        in_matrices = []
+        ex_matrices = []
+        resolutions = []
+        in_matrix = np.zeros((3, 3), dtype=np.float)
+        ex_matrix = np.zeros((4, 4), dtype=np.float)
+
+        with open(yaml_file, 'r') as file:
+            camera_params = yaml.load(file, Loader=yaml.Loader)
+            num_cam = len(camera_params["intrinsics"])
+            # The FullLoader parameter handles the conversion from YAML
+            # scalar values to Python the dictionary format
+
+        for i in range(num_cam):
+
+            rot = camera_params["extrinsics"][i]["rotation"]["data"]
+            translation = camera_params["extrinsics"][i]["translation"]["data"]
+            in_matrix[0, 0] = camera_params["intrinsics"][i]["fx"]/factor
+            in_matrix[1, 1] = camera_params["intrinsics"][i]["fy"]/factor
+            in_matrix[0, 2] = camera_params["intrinsics"][i]["cx"]/factor
+            in_matrix[1, 2] = camera_params["intrinsics"][i]["cy"]/factor
+            in_matrix[2, :] = np.array([0., 0., 1.])
+            resolutions.append(
+                (camera_params["intrinsics"][i]["img_width"]/factor, camera_params["intrinsics"][i]["img_height"]/factor))
+            for j in range(9):
+                row_index = np.floor(j / 3).astype(int)
+                col_index = np.floor(j % 3).astype(int)
+                ex_matrix[row_index, col_index] = rot[j]
+
+            for j in range(3):
+                ex_matrix[j, 3] = translation[j]
+
+            ex_matrix[3, :] = np.array([0., 0., 0., 1.])
+            # append to output
+            in_matrices.append(np.copy(in_matrix))
+            ex_matrices.append(np.copy(ex_matrix))
+
+        return in_matrices, ex_matrices, resolutions
+
 dataset_dict = {
     "blender": Blender,
     "llff": LLFF,
     "nsvf": NSVF,
+    "fs": FlexSight,
 }

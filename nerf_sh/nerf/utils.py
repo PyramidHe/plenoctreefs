@@ -99,6 +99,13 @@ def define_flags():
         "(used in the llff dataset only)",
     )
 
+    flags.DEFINE_integer(
+        "fshold",
+        8,
+        "will take every 1/N images as LLFF test set."
+        "(used in the fs dataset only)",
+    )
+
     # Model Flags
     flags.DEFINE_string("model", "nerf", "name of model to use.")
     flags.DEFINE_float("near", 2.0, "near clip of volumetric rendering.")
@@ -587,6 +594,56 @@ def generate_rays(w, h, focal, camtoworlds, equirect=False):
         origins=origins, directions=directions, viewdirs=viewdirs
     )
     return rays
+
+
+def fs_generate_rays(w, h, intrinsics, extrinsics, equirect=False):
+    """
+    Generate perspective camera rays. Principal point is at center.
+    Args:
+        w: int image width
+        h: int image heigth
+        intrinsics:
+        extrinsics:
+        equirect: if true, generates spherical rays instead of pinhole
+    Returns:
+        rays: Rays a namedtuple(origins [B, 3], directions [B, 3], viewdirs [B, 3])
+    """
+    x, y = np.meshgrid(  # pylint: disable=unbalanced-tuple-unpacking
+        np.arange(w, dtype=np.float32),  # X-Axis (columns)
+        np.arange(h, dtype=np.float32),  # Y-Axis (rows)
+        indexing="xy",
+    )
+
+    x = np.repeat(x[np.newaxis, :, :], extrinsics.shape[0], axis=0)
+    y = np.repeat(y[np.newaxis, :, :], extrinsics.shape[0], axis=0)
+    if equirect:
+        uv = np.stack([x * (2.0 / w) - 1.0, y * (2.0 / h) - 1.0], axis=-1)
+        camera_dirs = equirect2xyz(uv)
+    else:
+        camera_dirs = np.stack(
+            [
+                (x - intrinsics[:, 0, 2, None, None]) / intrinsics[:, 0, 0, None, None],
+                -(y - intrinsics[:, 1, 2, None, None]) / intrinsics[:, 1, 1, None, None],
+                -np.ones_like(x),
+            ],
+            axis=-1,
+        )
+
+    #  camera_dirs = camera_dirs / np.linalg.norm(camera_dirs, axis=-1, keepdims=True)
+
+    c2w = extrinsics[:, None, None, :3, :3]
+    camera_dirs = camera_dirs[Ellipsis, None]
+    directions = np.matmul(c2w, camera_dirs)[Ellipsis, 0]
+    origins = np.broadcast_to(
+        extrinsics[:, None, None, :3, -1], directions.shape
+    )
+    norms = np.linalg.norm(directions, axis=-1, keepdims=True)
+    viewdirs = directions / norms
+    rays = Rays(
+        origins=origins, directions=directions, viewdirs=viewdirs
+    )
+    return rays
+
 
 def equirect2xyz(uv):
     """
