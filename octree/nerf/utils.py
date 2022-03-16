@@ -487,7 +487,7 @@ def fs_generate_rays(w, h, intrinsics, extrinsics, equirect=False):
 
 def eval_octree(t, dataset, args, want_lpips=True, want_frames=False):
     import svox
-    w, h = dataset.w, dataset.h, dataset.focal
+    w, h = dataset.w, dataset.h
     if 'llff' in args.config and (not args.spherify):
         ndc_config = svox.NDCConfig(width=w, height=h, focal=focal)
     else:
