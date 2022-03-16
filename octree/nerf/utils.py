@@ -487,7 +487,7 @@ def fs_generate_rays(w, h, intrinsics, extrinsics, equirect=False):
 
 def eval_octree(t, dataset, args, want_lpips=True, want_frames=False):
     import svox
-    w, h, focal = dataset.w, dataset.h, dataset.focal
+    w, h = dataset.w, dataset.h, dataset.focal
     if 'llff' in args.config and (not args.spherify):
         ndc_config = svox.NDCConfig(width=w, height=h, focal=focal)
     else:
@@ -507,11 +507,11 @@ def eval_octree(t, dataset, args, want_lpips=True, want_frames=False):
     avg_lpips = 0.0
     out_frames = []
     for idx in tqdm(range(dataset.size)):
-        c2w = torch.from_numpy(dataset.camtoworlds[idx]).float().to(device)
+        c2w = torch.from_numpy(dataset.extrinsics[idx]).float().to(device)
         im_gt_ten = torch.from_numpy(dataset.images[idx]).float().to(device)
 
         im = r.render_persp(
-            c2w, width=w, height=h, fx=focal, fast=not args.no_early_stop)
+            c2w, width=w, height=h, fx=dataset.intrinsics[idx, 0, 0], fast=not args.no_early_stop)
         im.clamp_(0.0, 1.0)
 
         mse = ((im - im_gt_ten) ** 2).mean()
