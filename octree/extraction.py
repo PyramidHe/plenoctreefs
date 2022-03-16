@@ -203,7 +203,7 @@ def calculate_grid_weights(dataset, sigmas, reso, invradius, offset):
         cam.fy = dataset.intrinsics[idx, 1, 1]
         cam.width = w
         cam.height = h
-        cam.c2w = torch.from_numpy(dataset.camtoworlds[idx]).float().to(sigmas.device)
+        cam.c2w = torch.from_numpy(dataset.extrinsics[idx]).float().to(sigmas.device)
         grid_weight, grid_hit = _C.grid_weight_render(
             grid_data,
             cam,
