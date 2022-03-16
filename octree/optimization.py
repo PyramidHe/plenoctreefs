@@ -138,26 +138,29 @@ def main(unused_argv):
     def get_data(stage):
         assert stage in ["train", "val", "test"]
         dataset = datasets.get_dataset(stage, FLAGS)
-        focal = dataset.focal
-        all_c2w = dataset.camtoworlds
+        #focal = dataset.focal
+        all_c2w = dataset.extrinsics
+        all_intr = dataset.intrinsics
         all_gt = dataset.images.reshape(-1, dataset.h, dataset.w, 3)
         all_c2w = torch.from_numpy(all_c2w).float().to(device)
+        all_intr = torch.from_numpy(all_intr).float().to(device)
         all_gt = torch.from_numpy(all_gt).float()
-        return focal, all_c2w, all_gt
+        return all_intr, all_c2w, all_gt
 
-    focal, train_c2w, train_gt = get_data("train")
+    train_intr, train_c2w, train_gt = get_data("train")
     if FLAGS.split_train:
         test_sz = int(train_c2w.size(0) * FLAGS.split_holdout_prop)
         print('Splitting train to train/val manually, holdout', test_sz)
         perm = torch.randperm(train_c2w.size(0))
         test_c2w = train_c2w[perm[:test_sz]]
+        test_intr = train_intr[perm[:test_sz]]
         test_gt = train_gt[perm[:test_sz]]
         train_c2w = train_c2w[perm[test_sz:]]
         train_gt = train_gt[perm[test_sz:]]
+        train_intr = train_intr[perm[test_sz:]]
     else:
         print('Using given val set')
-        test_focal, test_c2w, test_gt = get_data("val")
-        assert focal == test_focal
+        test_intr, test_c2w, test_gt = get_data("val")
     H, W = train_gt[0].shape[:2]
 
     vis_dir = osp.splitext(FLAGS.input)[0] + '_render'
@@ -191,8 +194,8 @@ def main(unused_argv):
         print('Evaluating')
         with torch.no_grad():
             tpsnr = 0.0
-            for j, (c2w, im_gt) in enumerate(zip(test_c2w, test_gt)):
-                im = r.render_persp(c2w, height=H, width=W, fx=focal, fast=False)
+            for j, (intr, c2w, im_gt) in enumerate(zip(test_intr, test_c2w, test_gt)):
+                im = r.render_persp(c2w, height=H, width=W, fx=intr[0][0], fast=False)
                 im = im.cpu().clamp_(0.0, 1.0)
 
                 mse = ((im - im_gt) ** 2).mean()
@@ -212,8 +215,8 @@ def main(unused_argv):
     for i in range(FLAGS.num_epochs):
         print('epoch', i)
         tpsnr = 0.0
-        for j, (c2w, im_gt) in tqdm(enumerate(zip(train_c2w, train_gt)), total=n_train_imgs):
-            im = r.render_persp(c2w, height=H, width=W, fx=focal, cuda=True)
+        for j, (intr, c2w, im_gt) in tqdm(enumerate(zip(train_intr, train_c2w, train_gt)), total=n_train_imgs):
+            im = r.render_persp(c2w, height=H, width=W, fx=intr[0][0], cuda=True)
             im_gt_ten = im_gt.to(device=device)
             im = torch.clamp(im, 0.0, 1.0)
             mse = ((im - im_gt_ten) ** 2).mean()
