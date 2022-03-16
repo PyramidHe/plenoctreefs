@@ -652,6 +652,7 @@ class FlexSight(Dataset):
                 ex_matrix[j, 3] = translation[j]
 
             ex_matrix[3, :] = np.array([0., 0., 0., 1.])
+            ex_matrix = np.linalg.inv(ex_matrix)
             # append to output
             in_matrices.append(np.copy(in_matrix))
             ex_matrices.append(np.copy(ex_matrix))
