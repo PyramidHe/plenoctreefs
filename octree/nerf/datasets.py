@@ -69,15 +69,6 @@ class Dataset(threading.Thread):
         self.queue = queue.Queue(3)  # Set prefetch buffer to 3 batches.
         self.daemon = True
         self.split = split
-        if split == "train":
-            self._train_init(args)
-        elif split == "test":
-            self._test_init(args)
-        else:
-            raise ValueError(
-                'the split argument should be either "train" or "test", set'
-                "to {} here.".format(split)
-            )
         self.batch_size = args.batch_size // jax.host_count()
         self.image_batching = args.image_batching
         self.render_path = args.render_path
