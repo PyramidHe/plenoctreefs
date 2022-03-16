@@ -60,19 +60,25 @@ def convert_to_ndc(origins, directions, focal, w, h, near=1.0):
     directions = np.stack([d0, d1, d2], -1)
     return origins, directions
 
-
-class Dataset(threading.Thread):
+class Dataset():
     """Dataset Base Class."""
 
-    def __init__(self, split, args):
+    def __init__(self, split, args, prefetch=True):
         super(Dataset, self).__init__()
-        self.queue = queue.Queue(3)  # Set prefetch buffer to 3 batches.
-        self.daemon = True
         self.split = split
-        self.batch_size = args.batch_size // jax.host_count()
-        self.image_batching = args.image_batching
-        self.render_path = args.render_path
-        self.start()
+        self._general_init(args)
+
+    @property
+    def size(self):
+        return self.n_examples
+
+    def _general_init(self, args):
+        bbox_path = path.join(args.data_dir, 'bbox.txt')
+        if os.path.isfile(bbox_path):
+            self.bbox = np.loadtxt(bbox_path)[:-1]
+        else:
+            self.bbox = None
+        self._load_renderings(args)
 
     def __iter__(self):
         return self
