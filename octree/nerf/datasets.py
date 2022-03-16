@@ -18,16 +18,20 @@
 """Different datasets implementation plus a general port for all the datasets."""
 INTERNAL = False  # pylint: disable=g-statement-before-imports
 import json
+import yaml
 import os
 from os import path
+import queue
+import threading
+import warnings
 
 if not INTERNAL:
     import cv2  # pylint: disable=g-import-not-at-top
+import jax
 import numpy as np
 from PIL import Image
+from nerf_sh.nerf import utils
 from tqdm import tqdm
-
-from octree.nerf import utils
 
 
 def get_dataset(split, args):
@@ -57,25 +61,130 @@ def convert_to_ndc(origins, directions, focal, w, h, near=1.0):
     return origins, directions
 
 
-class Dataset():
+class Dataset(threading.Thread):
     """Dataset Base Class."""
 
-    def __init__(self, split, args, prefetch=True):
+    def __init__(self, split, args):
         super(Dataset, self).__init__()
+        self.queue = queue.Queue(3)  # Set prefetch buffer to 3 batches.
+        self.daemon = True
         self.split = split
-        self._general_init(args)
+        if split == "train":
+            self._train_init(args)
+        elif split == "test":
+            self._test_init(args)
+        else:
+            raise ValueError(
+                'the split argument should be either "train" or "test", set'
+                "to {} here.".format(split)
+            )
+        self.batch_size = args.batch_size // jax.host_count()
+        self.image_batching = args.image_batching
+        self.render_path = args.render_path
+        self.start()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        """Get the next training batch or test example.
+
+        Returns:
+          batch: dict, has "pixels" and "rays".
+        """
+        x = self.queue.get()
+        if self.split == "train":
+            return utils.shard(x)
+        else:
+            return utils.to_device(x)
+
+    def peek(self):
+        """Peek at the next training batch or test example without dequeuing it.
+
+        Returns:
+          batch: dict, has "pixels" and "rays".
+        """
+        x = self.queue.queue[0].copy()  # Make a copy of the front of the queue.
+        if self.split == "train":
+            return utils.shard(x)
+        else:
+            return utils.to_device(x)
+
+    def run(self):
+        if self.split == "train":
+            next_func = self._next_train
+        else:
+            next_func = self._next_test
+        while True:
+            self.queue.put(next_func())
 
     @property
     def size(self):
         return self.n_examples
 
-    def _general_init(self, args):
-        bbox_path = path.join(args.data_dir, 'bbox.txt')
-        if os.path.isfile(bbox_path):
-            self.bbox = np.loadtxt(bbox_path)[:-1]
-        else:
-            self.bbox = None
+    def __len__(self):
+        return self.size
+
+    def _train_init(self, args):
+        """Initialize training."""
         self._load_renderings(args)
+        self._generate_rays()
+
+        if args.image_batching:
+            # flatten the ray and image dimension together.
+            self.images = self.images.reshape([-1, 3])
+            self.rays = utils.namedtuple_map(
+                lambda r: r.reshape([-1, r.shape[-1]]), self.rays
+            )
+        else:
+            self.images = self.images.reshape([-1, self.resolution, 3])
+            self.rays = utils.namedtuple_map(
+                lambda r: r.reshape([-1, self.resolution, r.shape[-1]]), self.rays
+            )
+
+    def _test_init(self, args):
+        self._load_renderings(args)
+        self._generate_rays()
+        self.it = 0
+
+    def _next_train(self):
+        """Sample next training batch."""
+
+        if self.image_batching:
+            ray_indices = np.random.randint(
+                0, self.rays[0].shape[0], (self.batch_size,)
+            )
+            batch_pixels = self.images[ray_indices]
+            batch_rays = utils.namedtuple_map(lambda r: r[ray_indices], self.rays)
+        else:
+            image_index = np.random.randint(0, self.n_examples, ())
+            ray_indices = np.random.randint(
+                0, self.rays[0][0].shape[0], (self.batch_size,)
+            )
+            batch_pixels = self.images[image_index][ray_indices]
+            batch_rays = utils.namedtuple_map(
+                lambda r: r[image_index][ray_indices], self.rays
+            )
+        return {"pixels": batch_pixels, "rays": batch_rays}
+
+    def _next_test(self):
+        """Sample next test example."""
+        idx = self.it
+        self.it = (self.it + 1) % self.n_examples
+
+        if self.render_path:
+            return {"rays": utils.namedtuple_map(lambda r: r[idx], self.render_rays)}
+        else:
+            return {
+                "pixels": self.images[idx],
+                "rays": utils.namedtuple_map(lambda r: r[idx], self.rays),
+            }
+
+    # TODO(bydeng): Swap this function with a more flexible camera model.
+    def _generate_rays(self):
+        """Generating rays for all images."""
+        print(' Generating rays')
+        self.rays = utils.generate_rays(self.w, self.h, self.focal, self.camtoworlds)
 
 
 class Blender(Dataset):
@@ -120,6 +229,7 @@ class Blender(Dataset):
         self.camtoworlds = np.stack(cams, axis=0).astype(np.float32)
         camera_angle_x = float(meta["camera_angle_x"])
         self.focal = 0.5 * self.w / np.tan(0.5 * camera_angle_x)
+
         self.n_examples = self.images.shape[0]
 
 
@@ -379,7 +489,6 @@ class LLFF(Dataset):
             self.render_poses = new_poses[:, :3, :4]
         return poses_reset
 
-
 class NSVF(Dataset):
     """NSVF Generic Dataset."""
 
@@ -434,6 +543,7 @@ class NSVF(Dataset):
                 )
 
             images.append(image)
+        #case one channel images
         self.images = np.stack(images, axis=0)
         self.n_examples, self.h, self.w = self.images.shape[:3]
         self.resolution = self.h * self.w
@@ -444,8 +554,116 @@ class NSVF(Dataset):
             self.focal /= args.factor
 
 
+class FlexSight(Dataset):
+    """FlexSight Dataset."""
+
+    def _load_renderings(self, args):
+        """Load images from disk."""
+        if args.render_path:
+            raise ValueError("render_path cannot be used for the FlexSight dataset.")
+        args.data_dir = path.expanduser(args.data_dir)
+        img_files = sorted(os.listdir(path.join(args.data_dir, 'images')))
+        mask_files = sorted(os.listdir(path.join(args.data_dir, 'mask')))
+
+        images = []
+        mask = []
+        in_matrices, ex_matrices, resolutions = self.scanner_converter(path.join(args.data_dir, 'cameras.yml'), args.factor)
+        assert len(img_files) == len(ex_matrices)
+        print(' Load fs', args.data_dir, 'split', self.split, 'num_images', len(img_files))
+        for img_fname, mask_fname in tqdm(zip(img_files, mask_files), total=len(img_files)):
+            img_fname = path.join(args.data_dir, 'images', img_fname)
+            mask_fname = path.join(args.data_dir, 'mask', mask_fname)
+
+            with utils.open_file(img_fname, "rb") as imgin:
+                image = np.array(Image.open(imgin), dtype=np.float32) / 255.0
+            with utils.open_file(mask_fname, "rb") as maskin:
+                mask = np.array(Image.open(maskin), dtype=np.float32) / 255.0
+            if image.ndim < 3:
+                image = np.repeat(image[:, :, None], 3, axis=-1)
+
+            if args.white_bkgd:
+                image = image[..., :3] * mask[Ellipsis, None] + (1.0 - mask[Ellipsis, None])
+            else:
+                image = image[..., :3]
+            if args.factor > 1:
+                [rsz_h, rsz_w] = [hw // args.factor for hw in image.shape[:2]]
+                image = cv2.resize(
+                    image, (rsz_w, rsz_h), interpolation=cv2.INTER_AREA
+                )
+
+            images.append(image)
+
+        images = np.stack(images, axis=0)
+        # Select the split.
+        i_test = np.arange(images.shape[0])[:: args.fshold]
+        i_train = np.array(
+            [i for i in np.arange(int(images.shape[0])) if i not in i_test]
+        )
+        if self.split == "train":
+            indices = i_train
+        else:
+            indices = i_test
+        images = images[indices]
+        intrinsics = np.stack(in_matrices, axis=0).astype(np.float32)
+        extrinsics = np.stack(ex_matrices, axis=0).astype(np.float32)
+        intrinsics = intrinsics[indices]
+        extrinsics = extrinsics[indices]
+
+        print("tt", images.shape)
+        self.images = np.stack(images, axis=0)
+        self.n_examples, self.h, self.w = self.images.shape[:3]
+        self.resolution = self.h * self.w
+        self.intrinsics = intrinsics
+        self.extrinsics = extrinsics
+
+    def _generate_rays(self):
+        """
+        Generate normalized device coordinate rays for fs
+        """
+        self.rays = utils.fs_generate_rays(self.w, self.h, self.intrinsics, self.extrinsics)
+
+    def scanner_converter(self, yaml_file, factor=1.0):
+        in_matrices = []
+        ex_matrices = []
+        resolutions = []
+        in_matrix = np.zeros((3, 3), dtype=np.float)
+        ex_matrix = np.zeros((4, 4), dtype=np.float)
+
+        with open(yaml_file, 'r') as file:
+            camera_params = yaml.load(file, Loader=yaml.Loader)
+            num_cam = len(camera_params["intrinsics"])
+            # The FullLoader parameter handles the conversion from YAML
+            # scalar values to Python the dictionary format
+
+        for i in range(num_cam):
+
+            rot = camera_params["extrinsics"][i]["rotation"]["data"]
+            translation = camera_params["extrinsics"][i]["translation"]["data"]
+            in_matrix[0, 0] = camera_params["intrinsics"][i]["fx"]/factor
+            in_matrix[1, 1] = camera_params["intrinsics"][i]["fy"]/factor
+            in_matrix[0, 2] = camera_params["intrinsics"][i]["cx"]/factor
+            in_matrix[1, 2] = camera_params["intrinsics"][i]["cy"]/factor
+            in_matrix[2, :] = np.array([0., 0., 1.])
+            resolutions.append(
+                (camera_params["intrinsics"][i]["img_width"]/factor, camera_params["intrinsics"][i]["img_height"]/factor))
+            for j in range(9):
+                row_index = np.floor(j / 3).astype(int)
+                col_index = np.floor(j % 3).astype(int)
+                ex_matrix[row_index, col_index] = rot[j]
+
+            for j in range(3):
+                ex_matrix[j, 3] = translation[j]
+
+            ex_matrix[3, :] = np.array([0., 0., 0., 1.])
+            # append to output
+            in_matrices.append(np.copy(in_matrix))
+            ex_matrices.append(np.copy(ex_matrix))
+
+        return in_matrices, ex_matrices, resolutions
+
 dataset_dict = {
     "blender": Blender,
     "llff": LLFF,
     "nsvf": NSVF,
+    "fs": FlexSight,
 }

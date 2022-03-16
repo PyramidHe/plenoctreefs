@@ -179,7 +179,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 def calculate_grid_weights(dataset, sigmas, reso, invradius, offset):
-    w, h, focal = dataset.w, dataset.h, dataset.focal
+   
 
     opts = _C.RenderOptions()
     opts.step_size = FLAGS.renderer_step_size
@@ -192,15 +192,17 @@ def calculate_grid_weights(dataset, sigmas, reso, invradius, offset):
     else:
         opts.ndc_width = -1
 
-    cam = _C.CameraSpec()
-    cam.fx = focal
-    cam.fy = focal
-    cam.width = w
-    cam.height = h
+
 
     grid_data = sigmas.reshape((reso, reso, reso))
     maximum_weight = torch.zeros_like(grid_data)
     for idx in tqdm(range(dataset.size)):
+        w, h = dataset.w, dataset.h
+        cam = _C.CameraSpec()
+        cam.fx = dataset.intrinsics[idx, 0, 0]
+        cam.fy = dataset.intrinsics[idx, 1, 1]
+        cam.width = w
+        cam.height = h
         cam.c2w = torch.from_numpy(dataset.camtoworlds[idx]).float().to(sigmas.device)
         grid_weight, grid_hit = _C.grid_weight_render(
             grid_data,
