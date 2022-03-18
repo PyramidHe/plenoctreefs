@@ -634,7 +634,7 @@ class FlexSight(Dataset):
             num_cam = len(camera_params["intrinsics"])
             # The FullLoader parameter handles the conversion from YAML
             # scalar values to Python the dictionary format
-
+        cam_trans = np.diag(np.array([1, -1, -1, 1], dtype=np.float32))
         for i in range(num_cam):
 
             rot = camera_params["extrinsics"][i]["rotation"]["data"]
@@ -655,7 +655,8 @@ class FlexSight(Dataset):
                 ex_matrix[j, 3] = translation[j]
 
             ex_matrix[3, :] = np.array([0., 0., 0., 1.])
-            ex_matrix[:3, :3] = np.linalg.inv(ex_matrix[:3, :3])
+            ex_matrix = np.linalg.inv(ex_matrix)
+            ex_matrix = ex_matrix @ cam_trans
             # append to output
             in_matrices.append(np.copy(in_matrix))
             ex_matrices.append(np.copy(ex_matrix))
